@@ -1,189 +1,309 @@
-use std::collections::HashSet;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
+use std::thread;
 
-// Вспомогательный комбинатор итераторов
-enum EitherIt<It1, It2> {
-    It1(It1),
-    It2(It2),
+type ServerHandle = (mpsc::Sender<(usize, MessageKind)>, thread::JoinHandle<()>);
+
+#[derive(Debug)]
+enum MessageKind {
+    FinishAll,
+    NewServer,
+    Work { work_spec: String },
+    ChangeEpoch { epoch: String },
 }
 
-impl<It1, It2, T> Iterator for EitherIt<It1, It2>
-where
-    It1: Iterator<Item = T>,
-    It2: Iterator<Item = T>,
-{
-    type Item = T;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::It1(it1) => it1.next(),
-            Self::It2(it2) => it2.next(),
-        }
-    }
-}
-
-// Исправляет строки: заглавные после точек, термины (сравниваем регистро-независимо) - по шаблону
-fn fix(bytes_to_fix: &str, set_of_labels: &HashSet<String>, id: usize) -> String {
-    fn to_lower_iter(word: &str) -> impl Iterator<Item = char> {
-        // Rust старается учитывать, что заглавная и строчная
-        // unicode-буква может занимать разное число байт в utf-8
-        word.chars().flat_map(char::to_lowercase)
-    }
-
-    let mut shall_start_from_capital = true;
-
-    let mut percent_idx = 0;
-    fn get_bytes_diff(string: &str, substring: &str) -> usize {
-        substring.as_ptr() as usize - string.as_ptr() as usize
-    }
-
-    let result = bytes_to_fix
-        .split_whitespace()
-        .flat_map(|orig_word| {
-            if percent_idx < (get_bytes_diff(bytes_to_fix, orig_word) * 100) / bytes_to_fix.len() {
-                println!("[{id}]: {percent_idx}%");
-                percent_idx += 10;
+fn serve(
+    rx: mpsc::Receiver<(usize, MessageKind)>,
+    id: usize,
+    success_count: Arc<AtomicUsize>, // или другой тип
+    epoch: Arc<RwLock<String>>,
+) {
+    while let Ok((from, msg_kind)) = rx.recv() {
+        match msg_kind {
+            MessageKind::FinishAll => break,
+            MessageKind::NewServer => unreachable!("this message is not for server!"),
+            MessageKind::ChangeEpoch { epoch: new_epoch } => {
+                // <место для обновления epoch>
+                *epoch.write().unwrap() = new_epoch;
             }
-
-            let mut remaining = orig_word.chars();
-            let first_char = remaining.next().unwrap();
-            let first_char = if shall_start_from_capital {
-                EitherIt::It1(first_char.to_uppercase())
-            } else {
-                EitherIt::It2(first_char.to_lowercase())
-            };
-            shall_start_from_capital = *orig_word.as_bytes().last().unwrap() == b'.';
-            if let Some(label) = set_of_labels
-                .iter()
-                .find(|label| to_lower_iter(label).eq(to_lower_iter(orig_word)))
-            {
-                EitherIt::It1(label.chars().chain([' ']))
-            } else {
-                EitherIt::It2(first_char.chain(to_lower_iter(remaining.as_str()).chain([' '])))
+            MessageKind::Work { work_spec } => {
+                println!(
+                    "worker-{} is being asked by client-{} at epoch '{}' to work '{}'",
+                    id,
+                    from,
+                    epoch.read().unwrap(),
+                    work_spec
+                );
             }
-        })
-        .collect();
-
-    println!("[{id}]: 100%");
-
-
-    result
+        }
+        // <место обновления success_count>
+        success_count.fetch_add(1, Ordering::SeqCst);
+    }
+    println!("Finishing worker-{}", id);
 }
 
-// Делит строку на более-менее равные части
-fn split_n_impl(bytes: &[u8], from_idx: usize, to_idx: usize, parts_count: usize) -> Vec<&str> {
-    assert!(parts_count != 0);
-    if parts_count == 1 {
-        vec![str::from_utf8(&bytes[from_idx..to_idx]).unwrap()]
-    } else {
-        let mut idx = from_idx + (to_idx - from_idx) / 2;
-        while idx != 1 && &bytes[idx - 1..=idx] != ". ".as_bytes() {
-            idx -= 1;
+fn balance(
+    rx: mpsc::Receiver<(usize, MessageKind)>,
+    servers_count: usize,
+    success_count: Arc<AtomicUsize>,
+) {
+    fn make_and_append_server(
+        all_servers: &mut Vec<ServerHandle>,
+        success_count: Arc<AtomicUsize>,
+        epoch: Arc<RwLock<String>>,
+    ) {
+        // <место для кода>
+        let (tx, rx) = mpsc::channel();
+        let new_server_id = all_servers.len();
+        all_servers.push((
+            tx,
+            thread::spawn(move || serve(rx, new_server_id, success_count, epoch)),
+        ));
+    }
+
+    let epoch = Arc::new(RwLock::new("epoch-1".into()));
+    let mut servers = Vec::new();
+    for _ in 0..servers_count {
+        make_and_append_server(&mut servers, success_count.clone(), epoch.clone());
+    }
+    let mut next_server = 0usize;
+    while let Ok((from, msg_kind)) = rx.recv() {
+        match msg_kind {
+            MessageKind::FinishAll => {
+                // <место для кода: сначала отправить finish серверам, затем вызвать на них join>
+                for (tx, _) in &servers {
+                    tx.send((from, MessageKind::FinishAll)).unwrap();
+                }
+                for (_, thread) in servers {
+                    thread.join().unwrap();
+                }
+                break;
+            }
+            MessageKind::NewServer => {
+                make_and_append_server(&mut servers, success_count.clone(), epoch.clone());
+            }
+            MessageKind::Work { work_spec } => {
+                servers[next_server]
+                    .0
+                    .send((from, MessageKind::Work { work_spec }))
+                    .unwrap();
+            }
+            MessageKind::ChangeEpoch { epoch } => {
+                // <место для кода>
+                servers[next_server]
+                    .0
+                    .send((from, MessageKind::ChangeEpoch { epoch }))
+                    .unwrap();
+            }
         }
-        if idx == 0 {
-            vec![str::from_utf8(&bytes[from_idx..to_idx]).unwrap()]
-        } else if parts_count == 2 {
-            vec![
-                str::from_utf8(&bytes[from_idx..idx]).unwrap(),
-                str::from_utf8(&bytes[idx + 1..to_idx]).unwrap(),
-            ]
-        } else {
-            [
-                split_n_impl(bytes, from_idx, idx, parts_count / 2),
-                split_n_impl(bytes, idx + 1, to_idx, parts_count.div_ceil(2)),
-            ]
-            .concat()
-        }
+        next_server = (next_server + 1).rem_euclid(servers.len());
     }
 }
 
-fn split_n(s: &str, parts_count: usize) -> Vec<&str> {
-    split_n_impl(s.as_bytes(), 0, s.len(), parts_count)
+fn my_sleep() {
+    thread::sleep(std::time::Duration::from_millis(10))
 }
 
-fn run_parallel(string: String, set_of_labels: &HashSet<String>) -> String {
-    std::thread::scope(|scope| {
-        let threads_count = 4;
-        let parts = split_n(&string, threads_count);
+fn client1(server_tx: mpsc::Sender<(usize, MessageKind)>) {
+    let id = 1;
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "prepare".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-1".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-2".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+}
 
-        let mut result = String::new();
+fn client2(server_tx: mpsc::Sender<(usize, MessageKind)>) {
+    let id = 2;
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "prepare".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx.send((id, MessageKind::NewServer)).unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-1".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-2".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-3".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-4".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-5".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-6".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+}
 
-        // <место для кода с порождением потоков fix()>
-        let threads = parts
-            .into_iter()
-            .enumerate()
-            .map(|(id, part)| scope.spawn(move || fix(part, set_of_labels, id)))
-            .collect::<Vec<_>>();
-
-        for thread in threads {
-            let done_part = thread.join().unwrap();
-            result.push_str(&done_part);
-        }
-
-        result.truncate(result.len() - 1); // убираем завершающий пробел
-        result
-    })
+fn client3(server_tx: mpsc::Sender<(usize, MessageKind)>) {
+    let id = 3;
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "prepare".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-1".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::ChangeEpoch {
+                epoch: "epoch-2".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-2".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-3".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-4".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-5".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
+    server_tx
+        .send((
+            id,
+            MessageKind::Work {
+                work_spec: "work-6".into(),
+            },
+        ))
+        .unwrap();
+    my_sleep();
 }
 
 fn main() {
-    // Для простоты кода мы объединили многословные термины подчёркиванием,
-    // а термины, кончающиеся знаками препинания, выделили в отдельные термины
-    let orig = "Rust is used in several backend software projects of large web \
-                services. OpenDNS, a DNS resolution service owned by Cisco, \
-                uses Rust internally. Amazon_Web_Services uses Rust in \
-                \"performance-sensitive components\" of its several services. \
-                In 2019, AWS open-sourced Firecracker, a virtualization \
-                solution primarily written in Rust. Microsoft Azure IoT Edge, \
-                a platform used to run Azure services on IoT devices, has \
-                components implemented in Rust. Microsoft also uses Rust to run \
-                containerized modules with WebAssembly and Kubernetes. \
-                Cloudflare, a company providing content delivery network \
-                services, used Rust to build a new web proxy named Pingora for \
-                increased performance and efficiency. The npm package manager \
-                used Rust for its production authentication service in 2019.";
+    println!("Hello, world!");
+    let (server_tx, server_rx) = mpsc::channel();
+    let success_count = Arc::new(AtomicUsize::new(0)); // здесь бы подошёл arc<atomic> или другая комбинация
 
-    let mix = "RUst Is useD In seVeRal bacKend SOfTWArE ProjECTS OF LarGe wEb \
-                SERVICEs. oPENdNS, A DNS REsOlution sErvIce owneD by cIScO, \
-                uSES ruST inteRNaLLY. AMAzon_Web_SERvICEs uSEs rUST iN \
-                \"peRFOrmAnce-SEnSitivE COmPoneNtS\" OF iTs SeVeRal SeRViceS. \
-                In 2019, AWS oPEN-sOurCeD fIREcRaCKeR, A vIrTUAliZaTIOn \
-                solUtIon PrIMARiLY WrITteN iN Rust. MIcROSoFT AZuRE Iot edge, \
-                a platfOrm used tO rUN AzURe SErviCES on iOT DEvices, haS \
-                COMponEnts iMPLEmeNtED in RusT. mIcrOsOFt ALSO usEs RuSt to RUn \
-                CONtAinerIZED ModUlES WIth wEbasSEMBly anD kuBERNETEs. \
-                CloUdFlare, a cOMPAny proVIDiNg cONTeNT DEliVEry neTwOrK \
-                SErViCes, used ruSt TO bUILD A NeW weB pRoxY NaMED PIngora For \
-                iNCreASEd pERFOrMANCE And EFfiCieNcy. the NPM PAckAgE mAnAgEr \
-                uSed RuST FOR ITS PrODuctIOn AUTheNTIcaTiON sErvIce IN 2019.";
+    // пригодится, чтобы переместить в поток к серверам
+    let success_count_cloned = success_count.clone();
 
-    let dict = [
-        "Rust",
-        "Rust,",
-        "Rust.",
-        "OpenDNS,",
-        "DNS",
-        "Cisco,",
-        "Amazon_Web_Services",
-        "AWS",
-        "Firecracker,",
-        "Microsoft",
-        "Azure",
-        "IoT",
-        "Edge,",
-        "WebAssembly",
-        "Kubernetes.",
-        "Cloudflare",
-        "Pingora",
+    // <место для кода создания клиентов и серверов>
+    let server = thread::spawn(move || balance(server_rx, 4, success_count_cloned));
+    let (tx1, tx2, tx3) = (server_tx.clone(), server_tx.clone(), server_tx.clone());
+    let clients = [
+        thread::spawn(move || client1(tx1)),
+        thread::spawn(move || client2(tx2)),
+        thread::spawn(move || client3(tx3)),
     ];
+    for client in clients {
+        client.join().unwrap();
+    }
+    server_tx.send((0, MessageKind::FinishAll)).unwrap();
+    server.join().unwrap();
 
-    let result = std::thread::spawn(move || {
-        run_parallel(
-            mix.to_string(),
-            &dict.into_iter().map(String::from).collect(),
-        )
-    })
-    .join()
-    .unwrap();
-    // <место для кода с порождением потока run_parallel()>
-
-    println!("{}", result);
-    assert_eq!(result, orig);
+    println!("\nDone jobs = {}", success_count.load(Ordering::SeqCst));
 }
